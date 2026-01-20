@@ -23,7 +23,7 @@
         "env": null,
         "additional_envs": null,
         "render": false,
-        "render_video": true,
+        "render_video": false,
         "keep_all_videos": false,
         "video_skip": 5,
         "rollout": {
@@ -107,7 +107,7 @@
             "n_groups": 8
         },
         "ema": {
-            "enabled": true,
+            "enabled": false,
             "power": 0.75
         },
         "ddpm": {
