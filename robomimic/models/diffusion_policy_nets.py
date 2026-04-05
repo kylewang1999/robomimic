@@ -1,6 +1,6 @@
 """ This file contains nets used for Diffusion Policy. """
 import math
-from typing import Union
+from typing import cast, Union
 
 import torch
 import torch.nn as nn
@@ -37,6 +37,10 @@ class Upsample1d(nn.Module):
 
     def forward(self, x):
         return self.conv(x)
+
+
+DownsampleStage = tuple["ConditionalResidualBlock1D", "ConditionalResidualBlock1D", Union[Downsample1d, nn.Identity]]
+UpsampleStage = tuple["ConditionalResidualBlock1D", "ConditionalResidualBlock1D", Union[Upsample1d, nn.Identity]]
 
 
 class Conv1dBlock(nn.Module):
@@ -225,7 +229,8 @@ class ConditionalUnet1D(nn.Module):
         
         x = sample
         h = []
-        for idx, (resnet, resnet2, downsample) in enumerate(self.down_modules):
+        for idx, stage_modules in enumerate(self.down_modules):
+            resnet, resnet2, downsample = cast(DownsampleStage, tuple(stage_modules))
             x = resnet(x, global_feature)
             x = resnet2(x, global_feature)
             h.append(x)
@@ -234,7 +239,8 @@ class ConditionalUnet1D(nn.Module):
         for mid_module in self.mid_modules:
             x = mid_module(x, global_feature)
 
-        for idx, (resnet, resnet2, upsample) in enumerate(self.up_modules):
+        for idx, stage_modules in enumerate(self.up_modules):
+            resnet, resnet2, upsample = cast(UpsampleStage, tuple(stage_modules))
             x = torch.cat((x, h.pop()), dim=1)
             x = resnet(x, global_feature)
             x = resnet2(x, global_feature)
