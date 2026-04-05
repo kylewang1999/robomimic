@@ -15,7 +15,10 @@ import torch.nn as nn
 import torch
 import os
 import numpy as np
-import imageio
+try:
+    import imageio
+except ModuleNotFoundError:
+    imageio = None
 
 import robomimic.utils.tensor_utils as TensorUtils
 import robomimic.utils.torch_utils as TorchUtils
