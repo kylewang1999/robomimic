@@ -2,6 +2,8 @@
 Implementation of Diffusion Policy https://diffusion-policy.cs.columbia.edu/ by Cheng Chi
 """
 from typing import Callable, Union
+import copy
+import inspect
 import math
 from collections import OrderedDict, deque
 from packaging.version import parse as parse_version
@@ -9,10 +11,11 @@ import random
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-# requires diffusers==0.11.1
+# robomimic originally targeted diffusers==0.11.1; keep the legacy EMA contract
+# available so newer diffusers releases can still load and run these checkpoints.
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 from diffusers.schedulers.scheduling_ddim import DDIMScheduler
-from diffusers.training_utils import EMAModel
+from diffusers.training_utils import EMAModel as DiffusersEMAModel
 
 import robomimic.models.obs_nets as ObsNets
 import robomimic.models.diffusion_policy_nets as DPNets
@@ -26,6 +29,77 @@ import random
 import robomimic.utils.torch_utils as TorchUtils
 import robomimic.utils.tensor_utils as TensorUtils
 import robomimic.utils.obs_utils as ObsUtils
+
+
+class CompatEMAModel(DiffusersEMAModel):
+    """Bridge robomimic's legacy EMA usage onto newer diffusers releases."""
+
+    def __init__(self, parameters=None, *args, model=None, **kwargs):
+        module = None
+        if model is not None:
+            module = model
+            parameters = model.parameters()
+        elif isinstance(parameters, torch.nn.Module):
+            module = parameters
+            parameters = parameters.parameters()
+
+        if parameters is None:
+            raise TypeError("CompatEMAModel requires `parameters` or `model`.")
+
+        super().__init__(parameters, *args, **kwargs)
+
+        self.averaged_model = copy.deepcopy(module) if module is not None else None
+        if self.averaged_model is not None:
+            self.averaged_model.requires_grad_(False)
+            self.averaged_model.eval()
+            self._sync_averaged_model(module)
+
+    def _sync_averaged_model(self, module) -> None:
+        if self.averaged_model is None or module is None:
+            return
+
+        for averaged_param, shadow_param in zip(
+            self.averaged_model.parameters(), self.shadow_params
+        ):
+            averaged_param.copy_(shadow_param)
+        for averaged_buffer, live_buffer in zip(
+            self.averaged_model.buffers(), module.buffers()
+        ):
+            averaged_buffer.copy_(live_buffer)
+
+    @torch.no_grad()
+    def step(self, parameters):
+        module = parameters if isinstance(parameters, torch.nn.Module) else None
+        super().step(parameters)
+        self._sync_averaged_model(module)
+
+    def to(self, *args, **kwargs):
+        result = super().to(*args, **kwargs)
+        if self.averaged_model is not None:
+            self.averaged_model.to(*args, **kwargs)
+        return result
+
+
+def _make_ema_model(model: nn.Module, power: float):
+    signature = inspect.signature(DiffusersEMAModel.__init__)
+    if "model" in signature.parameters:
+        return DiffusersEMAModel(model=model, power=power)
+    return CompatEMAModel(model=model, power=power)
+
+
+@torch.no_grad()
+def _sync_ema_shadow_from_averaged_model(ema) -> None:
+    averaged_model = getattr(ema, "averaged_model", None)
+    shadow_params = getattr(ema, "shadow_params", None)
+    if averaged_model is None or shadow_params is None:
+        return
+
+    averaged_params = list(averaged_model.parameters())
+    assert len(averaged_params) == len(shadow_params), (
+        "EMA shadow parameters must match averaged_model parameters."
+    )
+    for shadow_param, averaged_param in zip(shadow_params, averaged_params):
+        shadow_param.copy_(averaged_param.detach())
 
 
 @register_algo_factory_func("diffusion_policy")
@@ -110,7 +184,7 @@ class DiffusionPolicyUNet(PolicyAlgo):
         # setup EMA
         ema = None
         if self.algo_config.ema.enabled:
-            ema = EMAModel(model=nets, power=self.algo_config.ema.power)
+            ema = _make_ema_model(model=nets, power=self.algo_config.ema.power)
                 
         # set attrs
         self.nets = nets
@@ -398,6 +472,7 @@ class DiffusionPolicyUNet(PolicyAlgo):
 
         if model_dict.get("ema", None) is not None:
             self.ema.averaged_model.load_state_dict(model_dict["ema"])
+            _sync_ema_shadow_from_averaged_model(self.ema)
 
         if load_optimizers:
             for k in model_dict["optimizers"]:
