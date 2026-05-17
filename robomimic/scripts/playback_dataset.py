@@ -63,11 +63,18 @@ Example usage below:
 
 import os
 import json
+import sys
+from pathlib import Path
 import h5py
 import argparse
 import imageio
 import numpy as np
 import random
+
+ROBOMIMIC_ROOT = Path(__file__).resolve().parents[2]
+ROBOMIMIC_ROOT_STR = str(ROBOMIMIC_ROOT)
+if ROBOMIMIC_ROOT_STR not in sys.path:
+    sys.path.insert(0, ROBOMIMIC_ROOT_STR)
 
 import robomimic
 import robomimic.utils.obs_utils as ObsUtils
