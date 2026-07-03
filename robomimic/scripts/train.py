@@ -362,7 +362,16 @@ def train(config, device, resume=False):
 
         # do rollouts at fixed rate or if it's time to save a new ckpt
         video_paths = None
-        rollout_check = (epoch % config.experiment.rollout.rate == 0) or (should_save_ckpt and ckpt_reason == "time")
+        rollout_rate = config.experiment.rollout.rate
+        rollout_rate_check = (
+            rollout_rate is not None and epoch % rollout_rate == 0
+        )
+        rollout_epoch_check = epoch in config.experiment.rollout.get("epochs", [])
+        rollout_check = (
+            rollout_rate_check
+            or rollout_epoch_check
+            or (should_save_ckpt and ckpt_reason == "time")
+        )
         if config.experiment.rollout.enabled and (epoch > config.experiment.rollout.warmstart) and rollout_check:
             # wrap model as a RolloutPolicy to prepare for rollouts
             rollout_model = RolloutPolicy(
