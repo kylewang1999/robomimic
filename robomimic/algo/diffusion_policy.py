@@ -6,6 +6,7 @@ import copy
 import inspect
 import math
 from collections import OrderedDict, deque
+from pathlib import Path
 from packaging.version import parse as parse_version
 import random
 import torch
@@ -22,6 +23,11 @@ import robomimic.models.diffusion_policy_nets as DPNets
 import robomimic.utils.tensor_utils as TensorUtils
 import robomimic.utils.torch_utils as TorchUtils
 import robomimic.utils.obs_utils as ObsUtils
+from robomimic.utils.frozen_encoder import (
+    copy_encoder_state,
+    load_frozen_encoder_anchor,
+    repository_relative_path,
+)
 
 from robomimic.algo import register_algo_factory_func, PolicyAlgo
 
@@ -124,6 +130,22 @@ def algo_config_to_class(algo_config):
 
 
 class DiffusionPolicyUNet(PolicyAlgo):
+    def _frozen_obs_encoder_enabled(self):
+        config = self.algo_config.frozen_obs_encoder
+        values = (
+            config.checkpoint,
+            config.checkpoint_sha256,
+            config.active_encoder_sha256,
+        )
+        if any(value is not None for value in values) and not all(
+            value is not None for value in values
+        ):
+            raise ValueError(
+                "Frozen observation encoder checkpoint and both SHA-256 values "
+                "must be configured together."
+            )
+        return all(value is not None for value in values)
+
     def _create_networks(self):
         """
         Creates networks and places them into @self.nets.
@@ -159,6 +181,26 @@ class DiffusionPolicyUNet(PolicyAlgo):
         })
 
         nets = nets.float().to(self.device)
+
+        self.frozen_obs_encoder_anchor = None
+        if self._frozen_obs_encoder_enabled():
+            if not self.algo_config.ema.enabled:
+                raise ValueError("Frozen observation encoder training requires EMA.")
+            config = self.algo_config.frozen_obs_encoder
+            self.frozen_obs_encoder_anchor = load_frozen_encoder_anchor(
+                config.checkpoint,
+                repo_root=Path.cwd(),
+                expected_checkpoint_sha256=config.checkpoint_sha256,
+                expected_active_encoder_sha256=config.active_encoder_sha256,
+                source=config.source,
+            )
+            encoder = nets["policy"]["obs_encoder"]
+            copy_encoder_state(
+                encoder,
+                self.frozen_obs_encoder_anchor.encoder_state,
+            )
+            encoder.requires_grad_(False)
+            encoder.eval()
         
         # setup noise scheduler
         noise_scheduler = None
@@ -193,6 +235,64 @@ class DiffusionPolicyUNet(PolicyAlgo):
         self.action_check_done = False
         self.obs_queue = None
         self.action_queue = None
+
+    def _create_optimizers(self):
+        if not self._frozen_obs_encoder_enabled():
+            return super()._create_optimizers()
+
+        noise_pred_net = self.nets["policy"]["noise_pred_net"]
+        optim_params = self.optim_params["policy"]
+        self.optimizers = {
+            "policy": TorchUtils.optimizer_from_optim_params(
+                net_optim_params=optim_params,
+                net=noise_pred_net,
+            )
+        }
+        self.lr_schedulers = {
+            "policy": TorchUtils.lr_scheduler_from_optim_params(
+                net_optim_params=optim_params,
+                net=noise_pred_net,
+                optimizer=self.optimizers["policy"],
+            )
+        }
+        self.step_lr_schedulers_every_batch = {
+            "policy": optim_params.learning_rate.get("step_every_batch", False)
+        }
+        names = [
+            f"policy.noise_pred_net.{name}"
+            for name, _ in noise_pred_net.named_parameters()
+        ]
+        print("Frozen-encoder optimizer parameters:")
+        for name in names:
+            print(f"  {name}")
+
+    @torch.no_grad()
+    def _pin_frozen_obs_encoders(self, *, restore=False):
+        if self.frozen_obs_encoder_anchor is None:
+            return
+        live_encoder = self.nets["policy"]["obs_encoder"]
+        if restore:
+            copy_encoder_state(
+                live_encoder,
+                self.frozen_obs_encoder_anchor.encoder_state,
+            )
+        live_encoder.requires_grad_(False)
+        live_encoder.eval()
+        if self.ema is not None:
+            ema_encoder = self.ema.averaged_model["policy"]["obs_encoder"]
+            if restore:
+                copy_encoder_state(
+                    ema_encoder,
+                    self.frozen_obs_encoder_anchor.encoder_state,
+                )
+            ema_encoder.requires_grad_(False)
+            ema_encoder.eval()
+            if restore:
+                _sync_ema_shadow_from_averaged_model(self.ema)
+
+    def set_train(self):
+        super().set_train()
+        self._pin_frozen_obs_encoders()
     
     def process_batch_for_training(self, batch):
         """
@@ -307,6 +407,7 @@ class DiffusionPolicyUNet(PolicyAlgo):
                 # update Exponential Moving Average of the model weights
                 if self.ema is not None:
                     self.ema.step(self.nets)
+                self._pin_frozen_obs_encoders()
                 
                 step_info = {
                     "policy_grad_norms": policy_grad_norms
@@ -445,12 +546,34 @@ class DiffusionPolicyUNet(PolicyAlgo):
         """
         Get dictionary of current model parameters.
         """
-        return {
+        payload = {
             "nets": self.nets.state_dict(),
             "optimizers": { k : self.optimizers[k].state_dict() for k in self.optimizers },
             "lr_schedulers": { k : self.lr_schedulers[k].state_dict() if self.lr_schedulers[k] is not None else None for k in self.lr_schedulers },
             "ema": self.ema.averaged_model.state_dict() if self.ema is not None else None,
         }
+        if self.frozen_obs_encoder_anchor is not None:
+            anchor = self.frozen_obs_encoder_anchor
+            repo_root = Path.cwd()
+            payload["representation_anchor"] = {
+                "selector_path": repository_relative_path(
+                    anchor.selector_path, repo_root
+                ),
+                "resolved_checkpoint_path": repository_relative_path(
+                    anchor.resolved_checkpoint_path, repo_root
+                ),
+                "checkpoint_sha256": anchor.checkpoint_sha256,
+                "source": self.algo_config.frozen_obs_encoder.source,
+                "module": "policy.obs_encoder",
+                "active_encoder_sha256": anchor.active_encoder_sha256,
+                "frozen": True,
+            }
+            payload["training_scope"] = {
+                "optimized_module": "policy.noise_pred_net",
+                "frozen_module": "policy.obs_encoder",
+                "optimizer_excludes_frozen_module": True,
+            }
+        return payload
 
     def deserialize(self, model_dict, load_optimizers=False):
         """
@@ -473,6 +596,7 @@ class DiffusionPolicyUNet(PolicyAlgo):
         if model_dict.get("ema", None) is not None:
             self.ema.averaged_model.load_state_dict(model_dict["ema"])
             _sync_ema_shadow_from_averaged_model(self.ema)
+        self._pin_frozen_obs_encoders(restore=True)
 
         if load_optimizers:
             for k in model_dict["optimizers"]:

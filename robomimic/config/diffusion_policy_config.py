@@ -58,6 +58,12 @@ class DiffusionPolicyConfig(BaseConfig):
         # EMA parameters
         self.algo.ema.enabled = True
         self.algo.ema.power = 0.75
+
+        # Optional behavior-anchored observation encoder.
+        self.algo.frozen_obs_encoder.checkpoint = None
+        self.algo.frozen_obs_encoder.checkpoint_sha256 = None
+        self.algo.frozen_obs_encoder.active_encoder_sha256 = None
+        self.algo.frozen_obs_encoder.source = "ema"
         
         # Noise Scheduler
         ## DDPM
