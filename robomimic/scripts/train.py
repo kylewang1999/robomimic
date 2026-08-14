@@ -42,6 +42,40 @@ from robomimic.algo import algo_factory, RolloutPolicy
 from robomimic.utils.log_utils import PrintLogger, DataLogger, flush_warnings
 
 
+def _save_initial_checkpoint(
+    *,
+    model,
+    config,
+    env_meta,
+    shape_meta,
+    ckpt_dir,
+    obs_normalization_stats,
+    action_normalization_stats,
+):
+    """Save the explicitly requested pre-optimization checkpoint."""
+    if 0 not in config.experiment.save.epochs:
+        return None
+    path = os.path.join(ckpt_dir, "model_epoch_0.pth")
+    TrainUtils.save_model(
+        model=model,
+        config=config,
+        env_meta=env_meta,
+        shape_meta=shape_meta,
+        variable_state=dict(
+            epoch=0,
+            optimizer_steps=0,
+            checkpoint_role="initialization",
+            best_valid_loss=None,
+            best_return=None,
+            best_success_rate=None,
+        ),
+        ckpt_path=path,
+        obs_normalization_stats=obs_normalization_stats,
+        action_normalization_stats=action_normalization_stats,
+    )
+    return path
+
+
 def train(config, device, resume=False):
     """
     Train a model using the algorithm.
@@ -261,6 +295,17 @@ def train(config, device, resume=False):
         ckpt_dict = maybe_dict_from_checkpoint(ckpt_path=ckpt_path)
         model.deserialize(ckpt_dict["model"])
 
+    if not resume:
+        _save_initial_checkpoint(
+            model=model,
+            config=config,
+            env_meta=env_meta_list[0] if len(env_meta_list) == 1 else env_meta_list,
+            shape_meta=shape_meta_list[0] if len(shape_meta_list) == 1 else shape_meta_list,
+            ckpt_dir=ckpt_dir,
+            obs_normalization_stats=obs_normalization_stats,
+            action_normalization_stats=action_normalization_stats,
+        )
+
     # save the config as a json file
     with open(os.path.join(log_dir, '..', 'config.json'), 'w') as outfile:
         json.dump(config, outfile, indent=4)
@@ -281,6 +326,10 @@ def train(config, device, resume=False):
     best_return = {k: -np.inf for k in envs} if config.experiment.rollout.enabled else None
     best_success_rate = {k: -1. for k in envs} if config.experiment.rollout.enabled else None
     last_ckpt_time = time.time()
+    training_started = time.time()
+    optimizer_batches_per_epoch = (
+        len(train_loader) if train_num_steps is None else int(train_num_steps)
+    )
 
     start_epoch = 1 # epoch numbers start at 1
     if resume:
@@ -426,6 +475,8 @@ def train(config, device, resume=False):
         # get variable state for saving model
         variable_state = dict(
             epoch=epoch,
+            optimizer_steps=epoch * optimizer_batches_per_epoch,
+            checkpoint_role="intermediate",
             best_valid_loss=best_valid_loss,
             best_return=best_return,
             best_success_rate=best_success_rate,
@@ -466,6 +517,21 @@ def train(config, device, resume=False):
         mem_usage = int(process.memory_info().rss / 1000000)
         data_logger.record("System/RAM Usage (MB)", mem_usage, epoch)
         print("\nEpoch {} Memory Usage: {} MB\n".format(epoch, mem_usage))
+        print(
+            "[training-progress] "
+            + json.dumps(
+                {
+                    "stage": "training",
+                    "task": os.environ.get("WKT_SOPE_TASK"),
+                    "epoch": epoch,
+                    "completed_optimizer_batches": epoch * optimizer_batches_per_epoch,
+                    "elapsed_seconds": time.time() - training_started,
+                    "output_dir": time_dir,
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
 
     # terminate logging
     data_logger.close()
