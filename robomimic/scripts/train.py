@@ -20,6 +20,7 @@ import json
 import numpy as np
 import time
 import os
+import random
 import shutil
 import psutil
 import sys
@@ -76,12 +77,43 @@ def _save_initial_checkpoint(
     return path
 
 
-def train(config, device, resume=False):
+def _capture_rng_state():
+    return {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch_cpu": torch.get_rng_state(),
+        "torch_cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [],
+    }
+
+
+def _restore_rng_state(state):
+    random.setstate(state["python"])
+    np.random.set_state(state["numpy"])
+    torch.set_rng_state(state["torch_cpu"])
+    if state["torch_cuda"]:
+        assert torch.cuda.is_available()
+        torch.cuda.set_rng_state_all(state["torch_cuda"])
+
+
+def _current_learning_rate(model):
+    for optimizer in model.optimizers.values():
+        return float(optimizer.param_groups[0]["lr"])
+    return None
+
+
+def train(
+    config,
+    device,
+    resume=False,
+    resume_checkpoint=None,
+    stop_after_epoch=None,
+):
     """
     Train a model using the algorithm.
     """
 
     # first set seeds
+    random.seed(config.train.seed)
     np.random.seed(config.train.seed)
     torch.manual_seed(config.train.seed)
 
@@ -272,16 +304,23 @@ def train(config, device, resume=False):
         device=device
     )
 
-    if resume:
+    continuing = resume or resume_checkpoint is not None
+    if continuing:
         # load ckpt dict
         print("*" * 50)
-        print("resuming from ckpt at {}".format(latest_model_path))
-        try:
-            ckpt_dict = FileUtils.load_dict_from_checkpoint(ckpt_path=latest_model_path)
-        except Exception as e:
-            print("got error: {} when loading from {}".format(e, latest_model_path))
-            print("trying backup path {}".format(latest_model_backup_path))
-            ckpt_dict = FileUtils.load_dict_from_checkpoint(ckpt_path=latest_model_backup_path)
+        if resume_checkpoint is not None:
+            print("starting continuation branch from {}".format(resume_checkpoint))
+            ckpt_dict = FileUtils.load_dict_from_checkpoint(
+                ckpt_path=str(resume_checkpoint)
+            )
+        else:
+            print("resuming from ckpt at {}".format(latest_model_path))
+            try:
+                ckpt_dict = FileUtils.load_dict_from_checkpoint(ckpt_path=latest_model_path)
+            except Exception as e:
+                print("got error: {} when loading from {}".format(e, latest_model_path))
+                print("trying backup path {}".format(latest_model_backup_path))
+                ckpt_dict = FileUtils.load_dict_from_checkpoint(ckpt_path=latest_model_backup_path)
         # load model weights and optimizer state
         model.deserialize(ckpt_dict["model"], load_optimizers=True)
         print("*" * 50)
@@ -295,7 +334,7 @@ def train(config, device, resume=False):
         ckpt_dict = maybe_dict_from_checkpoint(ckpt_path=ckpt_path)
         model.deserialize(ckpt_dict["model"])
 
-    if not resume:
+    if not continuing:
         _save_initial_checkpoint(
             model=model,
             config=config,
@@ -332,7 +371,7 @@ def train(config, device, resume=False):
     )
 
     start_epoch = 1 # epoch numbers start at 1
-    if resume:
+    if continuing:
         # load variable state needed for train loop
         variable_state = ckpt_dict["variable_state"]
         start_epoch = variable_state["epoch"] + 1 # start at next epoch, since this recorded the last epoch of training completed
@@ -342,8 +381,22 @@ def train(config, device, resume=False):
         print("*" * 50)
         print("resuming training from epoch {}".format(start_epoch))
         print("*" * 50)
+        if resume:
+            rng_state = variable_state.get("rng_state")
+            if rng_state is None:
+                print("[warning] resume checkpoint has no RNG state; continuing inexactly")
+            else:
+                _restore_rng_state(rng_state)
 
-    for epoch in range(start_epoch, config.train.num_epochs + 1):
+    final_epoch = config.train.num_epochs
+    if stop_after_epoch is not None:
+        final_epoch = min(final_epoch, int(stop_after_epoch))
+    assert final_epoch >= start_epoch - 1, (
+        "stop_after_epoch precedes the admitted continuation coordinate: "
+        "{} < {}".format(final_epoch, start_epoch - 1)
+    )
+
+    for epoch in range(start_epoch, final_epoch + 1):
         step_log = TrainUtils.run_epoch(
             model=model,
             data_loader=train_loader,
@@ -476,10 +529,11 @@ def train(config, device, resume=False):
         variable_state = dict(
             epoch=epoch,
             optimizer_steps=epoch * optimizer_batches_per_epoch,
-            checkpoint_role="intermediate",
+            checkpoint_role="resumable_training_state",
             best_valid_loss=best_valid_loss,
             best_return=best_return,
             best_success_rate=best_success_rate,
+            rng_state=_capture_rng_state(),
         )
 
         # Save model checkpoints based on conditions (success rate, validation loss, etc)
@@ -526,6 +580,13 @@ def train(config, device, resume=False):
                     "epoch": epoch,
                     "completed_optimizer_batches": epoch * optimizer_batches_per_epoch,
                     "elapsed_seconds": time.time() - training_started,
+                    "learning_rate": _current_learning_rate(model),
+                    "remaining_epochs": final_epoch - epoch,
+                    "eta_seconds": (
+                        (final_epoch - epoch)
+                        * (time.time() - training_started)
+                        / (epoch - start_epoch + 1)
+                    ),
                     "output_dir": time_dir,
                 },
                 sort_keys=True,
